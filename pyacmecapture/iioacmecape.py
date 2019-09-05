@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-""" Baylibre's ACME Cape Abstraction class
+""" Baylibre's ACME Probe Abstraction class.
 
-Baylibre's ACME Cape Abstraction class.
+Baylibre's ACME Probe Abstraction class.
 
 Inspired by work done on the "iio-capture" tool done by:
     - Paul Cercueil <paul.cercueil@analog.com>,
@@ -9,55 +9,39 @@ and the work done on "pyacmegraph" tool done by:
     - Sebastien Jan <sjan@baylibre.com>.
 """
 
+
 from __future__ import print_function
+import struct
 import traceback
-import xmlrpclib
-import iio
-from mltrace import MLTrace
+import numpy as np
+# import iio
+import logging
 from ping import ping
-from iioacmeprobe import IIOAcmeProbe
 
 
-__app_name__ = "IIO ACME Cape Python Library"
+__app_name__ = "IIO ACME Probe Python Library"
 __license__ = "MIT"
-__copyright__ = "Copyright 2018, Baylibre SAS"
-__date__ = "2018/03/01"
+__copyright__ = "Copyright 2019, Baylibre SAS"
+__date__ = "2019/08/29"
 __author__ = "Patrick Titiano"
 __email__ = "ptitiano@baylibre.com"
 __contact__ = "ptitiano@baylibre.com"
 __maintainer__ = "Patrick Titiano"
 __status__ = "Development"
-__version__ = "0.2"
+__version__ = "0.1"
 __deprecated__ = False
 
 
-class IIOAcmeCape(object):
-    """ Represent Baylibre's ACME cape.
 
-    This class is used to abstract Baylibre's ACME cape.
+
+class IIOAcmeProbe2(object):
+    """ Represent Baylibre's ACME probe. Allow controlling it as an IIO device.
+
+    This class is used to abstract Baylibre's ACME probe,
+    controlling it as an IIO device.
 
     """
-    def __init__(self, ip, verbose_level):
-        """ Initialise IIOAcmeCape module.
-
-        Args:
-            ip (string): network IP address of the ACME cape. May be either
-            of format '192.168.1.2' or 'baylibre-acme.local'.
-            verbose_level (int): how much verbose the debug trace shall be.
-
-        Returns:
-            None
-
-        """
-        self._ip = ip
-        self._verbose_level = verbose_level
-        self._trace = MLTrace(verbose_level, "ACME Cape")
-        self._iioctx = None
-        self._slots = []
-        # Hard-coded value until exported by ACME FW via IIO or XMLRPC service
-        self._slots_count = 8
-
-    def is_up(self):
+    def _is_up(self):
         """ Check if the ACME cape is up and running.
 
         Args:
@@ -69,232 +53,145 @@ class IIOAcmeCape(object):
         """
         return ping(self._ip)
 
-    def get_slot_count(self):
-        """ Return the number of slots available on the cape.
+    def __init__(self, ip, slot, name=None):
+        """ Initialise IIOAcmeProbe class
+
+        Args:
+            ip (string): network IP address of the ACME cape which ACME probe
+                belongs to. May be either of format '192.168.1.2' or
+                'baylibre-acme.local'.
+            slot (int): ACME cape slot, in which the ACME probe is attached to
+                (as labelled on the ACME cape).
+
+        Returns:
+            None
+
+        """
+        if name != None:
+            self._name = name
+        else:
+            self._name = ip + '-' + str(slot)
+        self._ip = ip
+        self._slot = slot
+        self._type = None
+        self._shunt = None
+        self._pwr_switch = None
+        self._iioctx = None
+        self._iio_buffer = None
+        logging.debug("New ACME Probe with IP %s & slot %s" % (self._ip, self._slot))
+
+    def _show_iio_device_attributes(self):
+        logging.debug("======== IIO Device infos ========")
+        logging.debug("To be completed...")
+        logging.debug("==================================")
+        return True
+
+    def name(self):
+        """ Return the name of the probe.
 
         Args:
             None
 
         Returns:
-            int: number of slots available on the cape (> 0).
+            string: the name of the probe
 
         """
-        self._trace.trace(1, "Slot count: %u" % self._slots_count)
-        return self._slots_count
+        return self._name
 
-    def _find_probes(self):
-        """ Enumerate ACEM probes attached to the ACME cape,
-            retrieving probe details.
-            Private function, not to be used outside of the module.
+    def slot(self):
+        """ Return the slot number (int) in which the probe is attached.
 
         Args:
             None
+
+        Returns:
+            int: slot number
+
+        """
+        return self._slot
+
+    def type(self):
+        """ Return the probe type (string).
+
+        Args:
+            None
+
+        Returns:
+            string: probe type ('JACK', 'USB', or 'HE10')
+
+        """
+        return self._type
+
+    def shunt(self):
+        """ Return the shunt resistor value of the probe (int, in micro-ohm)
+
+        Args:
+            None
+
+        Returns:
+            int: shunt resistor value (in micro-ohm)
+
+        """
+        return self._shunt
+
+    def has_power_switch(self):
+        """ Return True if the probe is equipped with a power switch,
+            False otherwise.
+
+        Args:
+            None
+
+        Returns:
+            bool: True if the probe is equipped with a power switch,
+                  False otherwise.
+
+        """
+        return self._pwr_switch
+
+    def enable_power(self, enable):
+        """ Enable the power switch of the probe (i.e. let the current go
+            through the probe and power the device).
+
+        Args:
+            enable (bool): True to power on the device,
+                           False to power off the device.
 
         Returns:
             bool: True if operation is successful, False otherwise.
 
         """
-        acme_server_address = "%s:%d" % (self._ip, 8000)
-
-        # Use ACME XMLRPC service
-        try:
-            proxy = xmlrpclib.ServerProxy("http://%s/acme" % acme_server_address)
-        except:
-            self._trace.trace(1,
-                              "Failed to use ACME XMLRPC service! (\"" +
-                              acme_server_address + "\")")
-            self._trace.trace(2, traceback.format_exc())
-            return False
-        self._trace.trace(1, "ACME XMLRPC service ready.")
-        # Browse ACME slots one by one to find which ones are populated
-        iio_device_idx = 0
-        for i in range(1, self._slots_count + 1):
-            try:
-                info = proxy.info("%s" % i)
-                self._trace.trace(2, info)
-            except:
-                self._trace.trace(1, "No XMLRPC service found for slot %d." % i)
-                continue
-            if info.find('Failed') != -1:
-                # Slot no used
-                self._trace.trace(1, "XMLRPC: ACME Cape slot %d is empty." % i)
-                self._slots.append(None)
+        if self.has_power_switch() is True:
+            logging.warning("enable_power() function not yet implemented!")
+            if enable is True:
+                # TODO (ptitiano@baylibre.com): implement feature
+                print("TODO enable power")
+                logging.debug("Power enabled.")
             else:
-                self._trace.trace(1, "XMLRPC: ACME Cape slot %d is used." % i)
-                # Retrieve probe type
-                if info.find("JACK") != -1:
-                    probe_type = "JACK"
-                elif info.find("USB") != -1:
-                    probe_type = "USB"
-                elif info.find("HE10") != -1:
-                    probe_type = "HE10"
-                else:
-                    self._trace.trace(1, "XMLRPC: probe type not found?!")
-                    self._slots.append(None)
-                    continue
-                self._trace.trace(2, "Probe type: " + probe_type)
-
-                # Retrieve shunt resistor value
-                pos1 = info.find("R_Shunt:")
-                if pos1 != -1:
-                    pos2 = info.find("uOhm")
-                    if pos2 != -1:
-                        shunt = info[pos1 + 9: pos2 - 1]
-                        self._trace.trace(2, "Probe shunt: " + shunt)
-                    else:
-                        self._trace.trace(1, "XMLRPC: probe shunt not found?!")
-                        continue
-                else:
-                    self._trace.trace(1, "XMLRPC: probe shunt not found?!")
-                    continue
-
-                # Retrieve power switch capability
-                if info.find("Has Power Switch") != -1:
-                    pwr_switch = True
-                else:
-                    pwr_switch = False
-                self._trace.trace(2, "Probe power switch: " + str(pwr_switch))
-
-                # Create IIOAcmeProbe instance
-                self._slots.append(IIOAcmeProbe(i, probe_type,
-                                                int(shunt), pwr_switch,
-                                                self._iioctx.devices[iio_device_idx],
-                                                self._verbose_level))
-                iio_device_idx = iio_device_idx + 1
+                # TODO (ptitiano@baylibre.com): implement feature
+                print("TODO disable power")
+                logging.debug("Power disabled.")
+        else:
+            logging.warn(1, "No power switch on this probe!")
+            return False
         return True
 
-    def _show_iio_context_attributes(self):
-        """ Display IIO contect attributes, for debug purposes.
-            Private function, not to be used outside of the module.
+    def set_oversampling_ratio(self, oversampling_ratio):
+        """ Set the capture oversampling ratio of the probe.
 
         Args:
-            None
-
-        Returns:
-            None
-
-        """
-        self._trace.trace(3, "======== IIO context infos ========")
-        self._trace.trace(3, "  Name: " + self._iioctx.name)
-        self._trace.trace(3, "  Library version: %u.%u (git tag: %s)" % self._iioctx.version)
-        self._trace.trace(3, "  Backend version: %u.%u (git tag: %s)" % self._iioctx.version)
-        self._trace.trace(3, "  Backend description string: " + self._iioctx.description)
-        if len(self._iioctx.attrs) > 0:
-            self._trace.trace(3, "  Attributes: %u" % len(self._iioctx.attrs))
-            for attr, value in self._iioctx.attrs.items():
-                self._trace.trace(3, "    " + attr + ": " + value)
-        self._trace.trace(3, "===================================")
-
-    def init(self):
-        """ Configure IIOAcmeCape. Create IIO context, detect attached probes.
-
-        Args:
-            None
-
-        Returns:
-            bool: True if operation is successful, False otherwise.
-
-        """
-        # Connecting to ACME
-        try:
-            self._trace.trace(1, "Connecting to %s..." % self._ip)
-            self._iioctx = iio.Context("ip:" + self._ip)
-        except OSError:
-            self._trace.trace(1, "Connection timed out!")
-            return False
-        except:
-            self._trace.trace(2, traceback.format_exc())
-            return False
-
-        if self._verbose_level >= 2:
-            self._show_iio_context_attributes()
-
-        # There is not yet an attribute in the IIO device to indicate in which
-        # ACME Cape slot the IIO device is attached. Hence, need to first find
-        # the populated ACME Cape slot(s), and then save this info.
-        try:
-            self._find_probes()
-        except:
-            self._trace.trace(2, traceback.format_exc())
-            return False
-
-        return True
-
-    def probe_is_attached(self, slot):
-        """ Return True if a probe is attached to selected slot, False otherwise.
-
-        Args:
-            slot (int): ACME cape slot, as labelled on the cape (>0).
-
-        Returns:
-            bool: True if a probe is attached to selected slot, False otherwise.
-
-        """
-        try:
-            # ACME slots are labelled from 1 to 8 on cape,
-            # but handled from 0 to 7 in SW.
-            if self._slots[slot - 1] is None:
-                self._trace.trace(1, "Slot %d not populated." % slot)
-                return False
-            self._trace.trace(1, "Slot %d populated." % slot)
-            return True
-        except:
-            self._trace.trace(1, "Failed to determine slot %d status!" % slot)
-            self._trace.trace(2, traceback.format_exc())
-            return False
-
-    def enable_capture_channel(self, slot, channel, enable):
-        """ Enable/disable capture of selected channel.
-
-        Args:
-            slot (int): ACME cape slot, as labelled on the cape (>0).
-            channel (string): channel to capture.
-            enable (bool): True to enable capture, False to disable it.
-
-        Returns:
-            bool: True if operation is successful, False otherwise.
-
-        """
-        try:
-            # ACME slots are labelled from 1 to 8 on cape,
-            # but handled from 0 to 7 in SW.
-            return self._slots[slot - 1].enable_capture_channel(channel, enable)
-        except AttributeError:
-            self._trace.trace(1, "No probe in slot %d" % slot)
-            return False
-        except:
-            self._trace.trace(1, "Failed to configure capture channel (slot %d)!" % slot)
-            self._trace.trace(2, traceback.format_exc())
-            return False
-
-    def set_oversampling_ratio(self, slot, oversampling_ratio):
-        """ Set the capture oversampling ratio of the selected probe.
-
-        Args:
-            slot (int): ACME cape slot, as labelled on the cape (>0).
             oversampling_ratio (int): oversampling ratio
 
         Returns:
             bool: True if operation is successful, False otherwise.
 
         """
-        try:
-            # ACME slots are labelled from 1 to 8 on cape,
-            # but handled from 0 to 7 in SW.
-            return self._slots[slot - 1].set_oversampling_ratio(oversampling_ratio)
-        except AttributeError:
-            self._trace.trace(1, "No probe in slot %d" % slot)
-            return False
-        except:
-            self._trace.trace(1, "Failed to configure oversampling ratio (slot %d)!" % slot)
-            self._trace.trace(2, traceback.format_exc())
-            return False
+        logging.warning("set_oversampling_ratio() function not yet implemented!")
+        return True
 
-    def enable_asynchronous_reads(self, slot, enable):
+    def enable_asynchronous_reads(self, enable):
         """ Enable asynchronous reads.
 
         Args:
-            slot (int): ACME cape slot, as labelled on the cape (>0).
             enable (bool): True to enable asynchronous reads,
                            False to disable asynchronous reads.
 
@@ -302,69 +199,27 @@ class IIOAcmeCape(object):
             bool: True if operation is successful, False otherwise.
 
         """
-        try:
-            # ACME slots are labelled from 1 to 8 on cape,
-            # but handled from 0 to 7 in SW.
-            return self._slots[slot - 1].enable_asynchronous_reads(enable)
-        except AttributeError:
-            self._trace.trace(1, "No probe in slot %d" % slot)
-            return False
-        except:
-            self._trace.trace(1, "Failed to configure asynchronous reads (slot %d)!" % slot)
-            self._trace.trace(2, traceback.format_exc())
-            return False
+        logging.warning("enable_asynchronous_reads() function not yet implemented!")
+        return True
 
-    def get_sampling_frequency(self, slot):
+    def get_sampling_frequency(self):
         """ Return the capture sampling frequency (in Hertz).
 
         Args:
-            slot (int): ACME cape slot, as labelled on the cape (>0).
+            None
 
         Returns:
             int: capture sampling frequency (in Hertz).
                  Return 0 in case of error.
 
         """
-        try:
-            # ACME slots are labelled from 1 to 8 on cape,
-            # but handled from 0 to 7 in SW.
-            return self._slots[slot - 1].get_sampling_frequency()
-        except AttributeError:
-            self._trace.trace(1, "No probe in slot %d" % slot)
-            return False
-        except:
-            self._trace.trace(1, "Failed to retrieve sampling frequency (slot %d)!" % slot)
-            self._trace.trace(2, traceback.format_exc())
-            return False
+        logging.warning("get_sampling_frequency() function not yet implemented!")
+        return True
 
-    def get_shunt(self, slot):
-        """ Return the shunt resistor value of the probe in selected slot
-
-        Args:
-            slot (int): ACME cape slot, as labelled on the cape (>0)
-
-        Returns:
-            int: shunt resistor value (in micro-ohm) in case of success,
-                 False otherwise.
-
-        """
-        try:
-            # ACME slots are labelled from 1 to 8 on cape,
-            # but handled from 0 to 7 in SW.
-            return self._slots[slot - 1].get_shunt()
-        except AttributeError:
-            self._trace.trace(1, "No probe in slot %d" % slot)
-            return False
-        except:
-            self._trace.trace(1, "Failed to retrieve shunt value (slot %d)!" % slot)
-            self._trace.trace(2, traceback.format_exc())
-            return False
-
-    def allocate_capture_buffer(self, slot, samples_count, cyclic=False):
+    def allocate_capture_buffer(self, samples_count, cyclic=False):
         """ Allocate buffer to store captured data.
 
         Args:
-            slot (int): ACME cape slot, as labelled on the cape (>0)
             samples_count (int): amount of samples to hold in buffer (> 0).
             cyclic (bool): True to make the buffer act as a circular buffer,
                            False otherwise.
@@ -373,47 +228,76 @@ class IIOAcmeCape(object):
             bool: True if operation is successful, False otherwise.
 
         """
-        try:
-            # ACME slots are labelled from 1 to 8 on cape,
-            # but handled from 0 to 7 in SW.
-            return self._slots[slot - 1].allocate_capture_buffer(samples_count, cyclic)
-        except AttributeError:
-            self._trace.trace(1, "No probe in slot %d" % slot)
-            return False
-        except:
-            self._trace.trace(1, "Failed to allocate capture buffer (slot %d)!" % slot)
-            self._trace.trace(2, traceback.format_exc())
-            return False
+        self._iio_buffer = iio.Buffer(self._iio_device, samples_count, cyclic)
+        if self._iio_buffer != None:
+            logging.debug("Buffer (count=%d, cyclic=%s) allocated." % (
+                samples_count, cyclic))
+            return True
+        logging.error("Failed to allocate buffer! (count=%d, cyclic=%s)" % (
+            samples_count, cyclic))
+        return False
 
-    def refill_capture_buffer(self, slot):
-        """ Fill capture buffer with new samples.
+    def enable_capture_channel(self, channel, enable):
+        """ Enable/disable capture of selected channel.
 
         Args:
-            slot (int): ACME cape slot, as labelled on the cape (>0)
+            channel (string): channel to capture ('voltage', 'current', or 'power')
+            enable (bool): True to enable capture, False to disable it.
 
         Returns:
             bool: True if operation is successful, False otherwise.
 
         """
         try:
-            # ACME slots are labelled from 1 to 8 on cape,
-            # but handled from 0 to 7 in SW.
-            return self._slots[slot - 1].refill_capture_buffer()
-        except AttributeError:
-            self._trace.trace(1, "No probe in slot %d" % slot)
-            return False
+            iio_ch = self._iio_device.find_channel(CHANNEL_DICT[channel])
+            if not iio_ch:
+                logging.error("Channel %s (%s) not found!" % (
+                    channel, CHANNEL_DICT[channel]))
+                return False
+            logging.debug("Channel %s (%s) found." % (
+                channel, CHANNEL_DICT[channel]))
+            if enable is True:
+                iio_ch.enabled = True
+                logging.debug(1, "Channel %s (%s) capture enabled." % (
+                    channel, CHANNEL_DICT[channel]))
+            else:
+                iio_ch.enabled = False
+                logging.debug(1, "Channel %s (%s) capture disabled." % (
+                    channel, CHANNEL_DICT[channel]))
         except:
-            self._trace.trace(1, "Failed to refill capture buffer (slot %d)!" % slot)
-            self._trace.trace(2, traceback.format_exc())
+            if enable is True:
+                logging.error("Failed to enable capture on channel %s (%s)!")
+            else:
+                logging.error("Failed to disable capture on channel %s (%s)!")
+            logging.error(traceback.format_exc())
             return False
+        return True
 
-    def read_capture_buffer(self, slot, channel):
+    def refill_capture_buffer(self):
+        """ Fill capture buffer with new samples.
+
+        Args:
+            None
+
+        Returns:
+            bool: True if operation is successful, False otherwise.
+
+        """
+        try:
+            self._iio_buffer.refill()
+        except:
+            logging.error("Failed to refill buffer!")
+            logging.error(traceback.format_exc())
+            return False
+        logging.debug("Buffer refilled.")
+        return True
+
+    def read_capture_buffer(self, channel):
         """ Return the samples stored in the capture buffer of selected channel.
             Take care of data scaling too.
 
         Args:
-            slot (int): ACME cape slot, as labelled on the cape (>0)
-            channel (string): capture channel
+            channel (string): capture channel ('voltage', 'current', or 'power')
 
         Returns:
             dict: a dictionary holding the scaled data, with the following keys:
@@ -423,13 +307,35 @@ class IIOAcmeCape(object):
 
         """
         try:
-            # ACME slots are labelled from 1 to 8 on cape,
-            # but handled from 0 to 7 in SW.
-            return self._slots[slot - 1].read_capture_buffer(channel)
-        except AttributeError:
-            self._trace.trace(1, "No probe in slot %d" % slot)
-            return False
+            # Retrieve channel
+            iio_ch = self._iio_device.find_channel(CHANNEL_DICT[channel])
+            # Retrieve samples (raw)
+            ch_buf_raw = iio_ch.read(self._iio_buffer)
+            if CHANNEL_DICT[channel] != 'timestamp':
+                # Retrieve channel scale
+                scale = float(iio_ch.attrs['scale'].value)
+                # Configure binary data format to unpack (16-bit signed integer)
+                unpack_str = 'h' * (len(ch_buf_raw) / struct.calcsize('h'))
+            else:
+                # No scale attribute on 'timestamp' channel
+                scale = 1.0
+                # Configure binary data format to unpack (64-bit signed integer)
+                unpack_str = 'q' * (len(ch_buf_raw) / struct.calcsize('q'))
+            # Unpack data
+            values = struct.unpack(unpack_str, ch_buf_raw)
+            logging.debug("Channel %s: %u samples read." % (channel, len(values)))
+            logging.debug("Channel %s samples       : %s" % (channel, str(values)))
+            # Scale values
+            logging.debug("Scale: %f" % scale)
+            if scale != 1.0:
+                scaled_values = np.asarray(values) * scale
+            else:
+                scaled_values = np.asarray(values)
+            logging.debug("Channel %s scaled samples: %s" % (channel, str(scaled_values)))
         except:
-            self._trace.trace(1, "Failed to read capture buffer (slot %d)!" % slot)
-            self._trace.trace(2, traceback.format_exc())
-            return False
+            logging.error("Failed to read channel %s buffer!" % channel)
+            logging.error(traceback.format_exc())
+            return None
+        return {"channel": channel,
+                "unit": CHANNEL_UNITS[channel],
+                "samples": scaled_values}
