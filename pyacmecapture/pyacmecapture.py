@@ -4,11 +4,6 @@
 This utility is designed to capture voltage, current and power samples with
 Baylibre's ACME Power Measurement solution (www.baylibre.com/acme).
 
-The following assumption(s) were made:
-    - ACME Cape slots are populated with probes starting from slot 1,
-      with no 'holes' in between (e.g. populating slots 1,2,3 is valid,
-                                       populating slots 1,2 4 is not)
-
 Inspired by work done on the "iio-capture" tool done by:
     - Paul Cercueil <paul.cercueil@analog.com>,
     - Marc Titinger <mtitinger@baylibre.com>,
@@ -16,12 +11,12 @@ Inspired by work done on the "iio-capture" tool done by:
 and the work done on "pyacmegraph" tool done by:
     - Sebastien Jan <sjan@baylibre.com>.
 
-Leveraged IIOAcmeCape and IIOAcmeProbe classes abstracting IIO/ACME details.
+Leveraged IIOAcmeProbe classes abstracting IIO/ACME details.
 
 Todo:
     * Fix Segmentation fault at end of script
     * Find a way to remove hard-coded power unit (uW)
-
+    * Allow capture to be interrupted before end and still return results
 """
 
 
@@ -31,12 +26,11 @@ import sys
 import os
 import argparse
 import threading
+import logging
 from time import time, localtime, strftime
-from colorama import init, Fore, Style
 import numpy as np
-from mltrace import MLTrace
-from iioacmecape import IIOAcmeCape
-from iiofakeacmecape import IIOFakeAcmeCape
+from iioacmeprobe import VirtualIIOAcmeProbe
+
 
 __app_name__ = "Python ACME Power Capture Utility"
 __license__ = "MIT"
@@ -47,7 +41,7 @@ __email__ = "ptitiano@baylibre.com"
 __contact__ = "ptitiano@baylibre.com"
 __maintainer__ = "Patrick Titiano"
 __status__ = "Development"
-__version__ = "0.21"
+__version__ = "0.4"
 __deprecated__ = False
 
 
@@ -57,20 +51,10 @@ _CAPTURED_CHANNELS = ["Time", "Vbat", "Ishunt"]
 _REPORT_1ST_COL_WIDTH = 13
 _REPORT_COLS_WIDTH_MIN = 7
 _REPORT_COL_PAD = 2
+_LOGGER_NAME = "pyacmecapture"
 
-def log(color, flag, msg):
-    """ Format messages as follow: "['color'ed 'flag'] 'msg'"
-
-    Args:
-        color (str): the color of the flag (e.g. Fore.RED, Fore.GREEN, ...)
-        flag (str): a custom flag (e.g. 'OK', 'FAILED', 'WARNING', ...)
-        msg (str): a custom message (e.g. 'this is my great custom message')
-
-    Returns:
-        None
-
-    """
-    print("[" + color + flag + Style.RESET_ALL + "] " + msg)
+# create logger
+_LOGGER = logging.getLogger(_LOGGER_NAME)
 
 
 def exit_with_error(err):
@@ -85,12 +69,10 @@ def exit_with_error(err):
     """
     print()
     if err != 0:
-        log(Fore.RED,
-            "FAILED", "Script execution terminated with error code %d." % err)
+        _LOGGER.error("Script execution terminated with error code %d.", err)
     else:
-        log(Fore.GREEN,
-            "SUCCESS", "Script execution completed with success.")
-    print("\n< There will be a 'Segmentation fault (core dumped)' error message after this one. >")
+        _LOGGER.info("Script execution successfully completed.")
+    print("\n< There may be a 'Segmentation fault (core dumped)' error message after this one. >")
     print("< This is a kwown bug. Please ignore it. >\n")
     exit(err)
 
@@ -102,16 +84,17 @@ class IIODeviceCaptureThread(threading.Thread):
     ACME probe / IIO device.
 
     """
-    def __init__(self, cape, slot, channels, bufsize, duration, verbose_level):
+
+    def __init__(self, probe, channels, bufsize, duration, verbose=False):
         """ Initialise IIODeviceCaptureThread class
 
         Args:
-            slot (int): ACME cape slot
+            probe: IIOAcmeProbe instance
             channels (list of strings): channels to capture
                         Supported channels: 'Vshunt', 'Vbat', 'Ishunt', 'Power'
             bufsize (int): capture buffer size (in samples)
             duration (int): capture duration (in seconds)
-            verbose_level (int): how much verbose the debug trace shall be
+            verbose (bool): print samples
 
         Returns:
             None
@@ -119,11 +102,11 @@ class IIODeviceCaptureThread(threading.Thread):
         """
         threading.Thread.__init__(self)
         # Init internal variables
-        self._cape = cape
-        self._slot = slot
+        self._probe = probe
         self._channels = channels
         self._bufsize = bufsize
         self._duration = duration
+        self._verbose = verbose
         self._timestamp_thread_start = None
         self._thread_execution_time = None
         self._refill_start_times = None
@@ -132,12 +115,24 @@ class IIODeviceCaptureThread(threading.Thread):
         self._read_end_times = None
         self._failed = None
         self._samples = None
-        self._verbose_level = verbose_level
-        self._trace = MLTrace(verbose_level, "Thread Slot %u" % self._slot)
-        self._trace.trace(
-            2,
-            "Thread params: slot=%u channels=%s buffer size=%u duration=%us" % (
-                self._slot, self._channels, self._bufsize, self._duration))
+
+        _LOGGER.debug(
+            "Thread parameters: probe=%s channels=%s buffer size=%u duration="
+            "%us verbose=%s", self._probe.name(), self._channels,
+            self._bufsize, self._duration, self._verbose)
+
+    def _log(self, loglevel, msg):
+        """ Print log messages, prefixed with thread name
+
+        Args:
+            loglevel (int): level or severity of the event to track
+            msg (string): message to log
+
+        Returns:
+            None
+
+        """
+        _LOGGER.log(loglevel, "[Thread " + self._probe.name() + "] " + msg)
 
     def configure_capture(self):
         """ Configure capture parameters (enable channel(s),
@@ -151,31 +146,33 @@ class IIODeviceCaptureThread(threading.Thread):
 
         """
         # Set oversampling for max perfs (4 otherwise)
-        if self._cape.set_oversampling_ratio(self._slot, _OVERSAMPLING_RATIO) is False:
-            self._trace.trace(1, "Failed to set oversampling ratio!")
+        if self._probe.set_oversampling_ratio(_OVERSAMPLING_RATIO) is False:
+            self._log(logging.ERROR, "Failed to set oversampling ratio!")
             return False
-        self._trace.trace(1, "Oversampling ratio set to 1.")
+        self._log(logging.DEBUG, "Oversampling ratio set to %u." % \
+            _OVERSAMPLING_RATIO)
 
         # Disable asynchronous reads
-        if self._cape.enable_asynchronous_reads(self._slot, _ASYNCHRONOUS_READS) is False:
-            self._trace.trace(1, "Failed to configure asynchronous reads!")
+        if self._probe.enable_asynchronous_reads(_ASYNCHRONOUS_READS) is False:
+            self._log(logging.ERROR, "Failed to configure asynchronous reads!")
             return False
-        self._trace.trace(1, "Asynchronous reads disabled.")
+        self._log(logging.DEBUG, "Asynchronous reads set to %s." % \
+            _ASYNCHRONOUS_READS)
 
         # Enable selected channels
         for ch in self._channels:
-            ret = self._cape.enable_capture_channel(self._slot, ch, True)
+            ret = self._probe.enable_capture_channel(ch, True)
             if ret is False:
-                self._trace.trace(1, "Failed to enable %s capture!" % ch)
+                self._log(logging.ERROR, "Failed to enable %s capture!" % ch)
                 return False
             else:
-                self._trace.trace(1, "%s capture enabled." % ch)
+                self._log(logging.DEBUG, "%s capture enabled."  % ch)
 
         # Allocate capture buffer
-        if self._cape.allocate_capture_buffer(self._slot, self._bufsize) is False:
-            self._trace.trace(1, "Failed to allocate capture buffer!")
+        if self._probe.allocate_capture_buffer(self._bufsize) is False:
+            self._log(logging.ERROR, "Failed to allocate capture buffer!")
             return False
-        self._trace.trace(1, "Capture buffer allocated.")
+        self._log(logging.DEBUG, "Capture buffer allocated.")
         return True
 
     def run(self):
@@ -197,7 +194,7 @@ class IIODeviceCaptureThread(threading.Thread):
         self._read_end_times = []
         for ch in self._channels:
             self._samples[ch] = None
-            self._samples["slot"] = self._slot
+            self._samples["name"] = self._probe.name()
             self._samples["channels"] = self._channels
             self._samples["duration"] = self._duration
 
@@ -206,17 +203,18 @@ class IIODeviceCaptureThread(threading.Thread):
         while elapsed_time < self._duration:
             # Capture samples
             self._refill_start_times.append(time())
-            ret = self._cape.refill_capture_buffer(self._slot)
+            ret = self._probe.refill_capture_buffer()
             self._refill_end_times.append(time())
             if ret != True:
-                self._trace.trace(1, "Warning: error during buffer refill!")
+                self._log(logging.WARNING, "Error during buffer refill!")
                 self._failed = True
             # Read captured samples
             self._read_start_times.append(time())
             for ch in self._channels:
-                s = self._cape.read_capture_buffer(self._slot, ch)
+                s = self._probe.read_capture_buffer(ch)
                 if s is None:
-                    self._trace.trace(1, "Warning: error during %s buffer read!" % ch)
+                    self._log(
+                        logging.WARNING, "Error during %s buffer read!" % ch)
                     self._failed = True
                 if self._samples[ch] is not None:
                     self._samples[ch]["samples"] = np.append(
@@ -226,12 +224,14 @@ class IIODeviceCaptureThread(threading.Thread):
                     self._samples[ch]["failed"] = False
                     self._samples[ch]["unit"] = s["unit"]
                     self._samples[ch]["samples"] = s["samples"]
-                self._trace.trace(3, "self._samples[%s] = %s" % (ch, str(self._samples[ch])))
+                if self._verbose is True:
+                    self._log(logging.DEBUG, "self._samples[%s] = %s" % (
+                        ch, str(self._samples[ch])))
             self._read_end_times.append(time())
             elapsed_time = time() - self._timestamp_thread_start
         self._thread_execution_time = time() - self._timestamp_thread_start
         self._samples[ch]["failed"] = self._failed
-        self._trace.trace(1, "Thread done.")
+        self._log(logging.DEBUG, "done.")
         return True
 
     def print_runtime_stats(self):
@@ -247,8 +247,9 @@ class IIODeviceCaptureThread(threading.Thread):
             None
 
         """
-        self._trace.trace(1, "------------- Thread Runtime Stats -------------")
-        self._trace.trace(1, "Thread execution time: %s" % self._thread_execution_time)
+        self._log(logging.DEBUG, "------------- Runtime Stats -------------")
+        self._log(
+            logging.DEBUG, "Execution time: %s" % self._thread_execution_time)
         # Convert list to numpy array
         self._refill_start_times = np.asarray(self._refill_start_times)
         self._refill_end_times = np.asarray(self._refill_end_times)
@@ -273,57 +274,77 @@ class IIODeviceCaptureThread(threading.Thread):
             self._read_end_times, self._read_start_times)
 
         # Print time each time buffer was getting refilled
-        self._trace.trace(2, "Buffer Refill start times (ms): %s" % self._refill_start_times)
-        self._trace.trace(2, "Buffer Refill end times (ms): %s" % self._refill_end_times)
+        self._log(logging.DEBUG, "Buffer Refill start times (ms): %s" % \
+            self._refill_start_times)
+        self._log(logging.DEBUG, "Buffer Refill end times (ms): %s" % \
+            self._refill_end_times)
         # Print time spent refilling buffer
-        self._trace.trace(2, "Buffer Refill duration (ms): %s" % refill_durations)
+        self._log(
+            logging.DEBUG, "Buffer Refill duration (ms): %s" % refill_durations)
         if len(self._refill_start_times) > 1:
             # Print buffer refill time stats
             refill_durations_min = np.amin(refill_durations)
             refill_durations_max = np.amax(refill_durations)
             refill_durations_avg = np.average(refill_durations)
-            self._trace.trace(1, "Buffer Refill Duration (ms): min=%s max=%s avg=%s" % (
-                refill_durations_min,
-                refill_durations_max,
-                refill_durations_avg))
+            self._log(
+                logging.DEBUG,
+                "Buffer Refill Duration (ms): min=%s max=%s avg=%s" % (
+                    refill_durations_min,
+                    refill_durations_max,
+                    refill_durations_avg))
             # Print delays between 2 consecutive buffer refills
             refill_delays = np.ediff1d(self._refill_start_times)
-            self._trace.trace(2, "Delay between 2 Buffer Refill (ms): %s" % refill_delays)
+            self._log(
+                logging.DEBUG,
+                "Delay between 2 Buffer Refill (ms): %s" % refill_delays)
             # Print buffer refill delay stats
             refill_delays_min = np.amin(refill_delays)
             refill_delays_max = np.amax(refill_delays)
             refill_delays_avg = np.average(refill_delays)
-            self._trace.trace(1, "Buffer Refill Delay (ms): min=%s max=%s avg=%s" % (
-                refill_delays_min,
-                refill_delays_max,
-                refill_delays_avg))
+            self._log(
+                logging.DEBUG,
+                "Buffer Refill Delay (ms): min=%s max=%s avg=%s" % (
+                    refill_delays_min,
+                    refill_delays_max,
+                    refill_delays_avg))
 
         # Print time each time buffer was getting read
-        self._trace.trace(2, "Buffer Read start times (ms): %s" % self._read_start_times)
-        self._trace.trace(2, "Buffer Read end times (ms): %s" % self._read_end_times)
+        self._log(
+            logging.DEBUG,
+            "Buffer Read start times (ms): %s" % self._read_start_times)
+        self._log(
+            logging.DEBUG,
+            "Buffer Read end times (ms): %s" % self._read_end_times)
         # Print time spent reading buffer
-        self._trace.trace(2, "Buffer Read duration (ms): %s" % read_durations)
+        self._log(
+            logging.DEBUG, "Buffer Read duration (ms): %s" % read_durations)
         if len(self._read_start_times) > 1:
             # Print buffer read time stats
             read_durations_min = np.amin(read_durations)
             read_durations_max = np.amax(read_durations)
             read_durations_avg = np.average(read_durations)
-            self._trace.trace(1, "Buffer Read Duration (ms): min=%s max=%s avg=%s" % (
-                read_durations_min,
-                read_durations_max,
-                read_durations_avg))
+            self._log(
+                logging.DEBUG,
+                "Buffer Read Duration (ms): min=%s max=%s avg=%s" % (
+                    read_durations_min,
+                    read_durations_max,
+                    read_durations_avg))
             # Print delays between 2 consecutive buffer reads
             read_delays = np.ediff1d(self._read_start_times)
-            self._trace.trace(2, "Delay between 2 Buffer Read (ms): %s" % read_delays)
+            self._log(
+                logging.DEBUG,
+                "Delay between 2 Buffer Read (ms): %s" % read_delays)
             # Print buffer read delay stats
             read_delays_min = np.amin(read_delays)
             read_delays_max = np.amax(read_delays)
             read_delays_avg = np.average(read_delays)
-            self._trace.trace(1, "Buffer Read Delay (ms): min=%s max=%s avg=%s" % (
-                read_delays_min,
-                read_delays_max,
-                read_delays_avg))
-        self._trace.trace(1, "------------------------------------------------")
+            self._log(
+                logging.DEBUG,
+                "Buffer Read Delay (ms): min=%s max=%s avg=%s" % (
+                    read_delays_min,
+                    read_delays_max,
+                    read_delays_avg))
+        self._log(logging.DEBUG, "-----------------------------------------")
 
     def get_samples(self):
         """ Return collected samples. To be called once thread completed.
@@ -333,7 +354,7 @@ class IIODeviceCaptureThread(threading.Thread):
 
         Returns:
             dict: a dictionary (one per channel) containing following key/data:
-                "slot" (int): ACME cape slot
+                "name" (string): ACME probe name
                 "channels" (list of strings): channels captured
                 "duration" (int): capture duration (in seconds)
                 For each captured channel:
@@ -342,7 +363,7 @@ class IIODeviceCaptureThread(threading.Thread):
                     "samples" (array): captured samples
                     "unit" (str): captured samples unit}}
             E.g:
-                {'slot': 1, 'channels': ['Vbat', 'Ishunt'], 'duration': 3,
+                {'name': 'VDD1', 'channels': ['Vbat', 'Ishunt'], 'duration': 3,
                  'Vbat': {'failed': False, 'samples': array([ 1, 2, 3 ]), 'unit': 'mV'},
                  'Ishunt': {'failed': False, 'samples': array([4, 5, 6 ]), 'unit': 'mA'}}
 
@@ -363,14 +384,10 @@ def main():
     # Print application header
     print(__app_name__ + " (version " + __version__ + ")\n")
 
-    # Colorama: reset style to default after each call to print
-    init(autoreset=True)
-
     # Parse user arguments
     parser = argparse.ArgumentParser(
-        description='TODO',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=
+        description=
         '''This tool captures min, max, and average values of selected
            power rails (voltage, current, power).
            These power measurements are performed using Baylibre's
@@ -378,263 +395,321 @@ def main():
 
            Example usage:
            $ ''' + sys.argv[0] +
-        ''' --ip baylibre-acme.local --duration 5 -c 2 -n VDD_1,VDD_2
+        ''' --probes 192.168.1.2:1,3,5..8 baylibre-acme.local:2 --names C1-VDD1 C1-VDD3 C1-VDD5 C1-VDD6 C1-VDD7 C1-VDD8 C2-VDD2 --duration 5''')
 
-           Note it is assumed that slots are populated from slot 1 and
-           upwards, with no hole.''')
     parser.add_argument(
-        '--ip', metavar='HOSTNAME',
-        default='baylibre-acme.local',
-        help='ACME hostname (e.g. 192.168.1.2 or baylibre-acme.local)')
-    parser.add_argument('--count', '-c', metavar='COUNT', type=int, default=8,
-                        help='Number of power rails to capture (> 0))')
-    parser.add_argument('--slots', '-s', metavar='SLOTS', default=None,
-                        help='''List of ACME slot(s) to be captured
-                        (comma-separated list, without any whitespace,
-                        as labelled on the cape,
-                        starting from ACME Cape slot 1 and upwards,
-                        option '--count' ignored when '--slots' is used).
-                        E.g. 1,2,4,7''')
+        '--probes', '-p', metavar='PROBES', nargs='+',
+        default='baylibre-acme.local:1..8',
+        help='''List of ACME probes to sample, using following syntax:
+                hostname1:slot(s),hostname2:slot(s)
+                Hostname may be either IP address or network name
+                (e.g. 192.168.1.2 or baylibre-acme.local).
+                To specify multiple hostnames, separate each hostname with
+                a comma.
+                slot(s) is the cape's slot(s) the probe is connected to,
+                as labelled on the cape. It always starts from 1.
+                slot(s) may be a single one, a range, or a list of
+                non-consecutive slots.
+                To specify a range of slots, specify the first and last slots,
+                separated with '..' (e.g. 4..8).
+                To specify a list of non-consecutive slots, separate each slot
+                with a comma (e.g. 1,2,5).''')
+
     parser.add_argument('--names', '-n', metavar='LABELS', default=None,
+                        nargs='+',
                         help='''List of names for the captured power rails
-                        (comma-separated list without any whitespace,
-                        one name per power rail,
-                        starting from ACME Cape slot 1 and upwards).
-                        E.g. VDD_BAT,VDD_ARM''')
+                        (one name per power rail,
+                        following same order as '--probes').
+                        E.g. VDD_BAT VDD_ARM VDD_SOC VDD_GPU''')
+
     parser.add_argument('--duration', '-d', metavar='SEC', type=int,
-                        default=10, help='Capture duration in seconds (> 0)')
+                        default=10, help='Capture duration in seconds (> 0).')
     parser.add_argument('--bufsize', '-b', metavar='BUFFER SIZE', type=int,
-                        default=127, help='Capture duration in seconds (> 0)')
+                        default=127, help='Capture buffer size (in samples).')
+
     parser.add_argument(
         '--outdir', '-od', metavar='OUTPUT DIRECTORY',
         default=None,
-        help='''Output directory (default: $HOME/pyacmecapture/yyyymmdd-hhmmss/''')
+        help='''Output directory where report and trace files will be saved
+                (default: $HOME/pyacmecapture/yyyymmdd-hhmmss/).''')
     parser.add_argument(
         '--out', '-o', metavar='OUTPUT FILE', default=None,
         help='''Output file name (default: date (yyyymmdd-hhmmss''')
     parser.add_argument('--nofile', '-x', action="store_true", default=False,
-                        help='''Do not export report and trace files''')
-    parser.add_argument('--fake', '-f', action="store_true", default=False,
-                        help='''Use a fake cape (SW-simulated,
+                        help='''Do not export report and trace files.''')
+
+    parser.add_argument('--virtual', action="store_true", default=False,
+                        help='''Use a virtual cape (SW-simulated,
                         no real HW access).
                         Use for development purposes only.''')
-    parser.add_argument('--verbose', '-v', action='count',
-                        help='print debug traces (various levels v, vv, vvv)')
+
+    parser.add_argument(
+        '--loglevel', '-l', metavar='LOGLEVEL', default='WARNING',
+        help='''Logging level (default: WARNING).''')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Use this option to trace internal variables.')
 
     args = parser.parse_args()
-    log(Fore.GREEN, "OK", "Parse user arguments")
 
-    # Use MLTrace to log execution details
-    trace = MLTrace(args.verbose)
-    trace.trace(2, "User args: " + str(args)[10:-1])
-    err = err - 1
-
-    # Create an IIOAcmeCape instance
-    if args.fake is False:
-        iio_acme_cape = IIOAcmeCape(args.ip, args.verbose)
+    # Configure logging level
+    numeric_level = getattr(logging, args.loglevel.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError('Invalid log level: %s' % args.loglevel)
+    if args.loglevel.upper() == 'DEBUG':
+        logging.basicConfig(
+            format='%(levelname)s: %(name)s: %(message)s',
+            name=_LOGGER_NAME, level=numeric_level)
     else:
-        iio_acme_cape = IIOFakeAcmeCape(args.ip, args.verbose)
-    max_rail_count = iio_acme_cape.get_slot_count()
+        logging.basicConfig(
+            format='%(levelname)s: %(message)s',
+            level=numeric_level)
 
-    # Check arguments are valid
-    try:
-        assert args.count <= max_rail_count
-        assert args.count > 0
-    except:
-        log(Fore.RED, "FAILED", "Check user argument ('count')")
-        exit_with_error(err)
-
-    try:
-        if args.slots is not None:
-            args.slots = args.slots.split(',')
-            for index, item in enumerate(args.slots):
-                args.slots[index] = int(item)
-                assert args.slots[index] <= max_rail_count
-                assert args.slots[index] > 0
-            args.count = len(args.slots)
-        else:
-            args.slots = range(1, args.count + 1)
-    except:
-        log(Fore.RED, "FAILED", "Check user argument ('slots')")
-        exit_with_error(err)
-
-    try:
-        if args.names is not None:
-            args.names = args.names.split(',')
-            trace.trace(2, "args.names: %s" % args.names)
-            assert args.count == len(args.names)
-    except:
-        log(Fore.RED, "FAILED", "Check user argument ('names')")
-        exit_with_error(err)
-
+    # Parse user arguments and check that they are valid
+    _LOGGER.debug("User arguments: " + str(args)[10:-1])
+    # Check duration and buffer size are valid
     try:
         assert args.duration > 0
     except:
-        log(Fore.RED, "FAILED", "Check user argument ('duration')")
+        _LOGGER.error("Wrong user argument ('duration')")
+        exit_with_error(err)
+    try:
+        assert args.bufsize > 0
+    except:
+        _LOGGER.error("Wrong user argument ('bufsize')")
         exit_with_error(err)
     err = err - 1
-    log(Fore.GREEN, "OK", "Check user arguments")
+    # Retrieve probes list and names
+    # Accepted formats: (and any combinations of these)
+    #   ip:slot
+    #   ip:slotA,slotB,slotC
+    #   ip:slotStart..SlotEnd
+    #   ip:slotA,slotB ip:slotC
+    probes = []
+    # Retrieve probe IP and slot
+    for probe in args.probes:
+        try:
+            probe = probe.split(':')
+            ip = probe[0]
+            slots = probe[1].split(',')
+            for slot in slots:
+                if '..' not in slot:
+                    probes.append({"ip": ip, "slot": int(slot), 'name': None})
+                else:
+                    slot_range = slot.split('..')
+                    probes.append({
+                        "ip": ip, "slot": int(slot_range[0]), 'name': None})
+                    slot_range = range(
+                        int(slot_range[0]) + 1, int(slot_range[1]) + 1, 1)
+                    for i in slot_range:
+                        probes.append({"ip": ip, "slot": i, 'name': None})
+        except:
+            _LOGGER.error("Failed to parse probes!")
+            _LOGGER.debug(traceback.format_exc())
+            exit_with_error(err)
+    _LOGGER.debug("probe list: %s", probes)
+    # Add name to probe
+    if args.names is not None:
+        try:
+            assert len(args.names) == len(probes)
+        except:
+            _LOGGER.error(
+                "names count (%u) do not match probes count (%u)!",
+                len(args.names), len(probes))
+            exit_with_error(err)
+        for i, name in enumerate(args.names):
+            probes[i]['name'] = name
+    else:
+        for probe in probes:
+            probe['name'] = probe['ip'] + '-' + str(probe['slot'])
+    _LOGGER.debug("probe list with names: %s", probes)
+
+    _LOGGER.info("User arguments parsed.")
+    err = err - 1
+
+    # Create IIOAcmeProbe instance(s)
+    try:
+        for probe in probes:
+            if args.virtual is False:
+                print("not yet implemented")
+                exit_with_error(0)
+            else:
+                probe['dev'] = VirtualIIOAcmeProbe(
+                    probe['ip'], probe['slot'], probe['name'])
+    except:
+        _LOGGER.critical("ACME Probe instance instantiation failed!")
+        _LOGGER.debug("failed probe: %s", probe)
+        _LOGGER.debug(traceback.format_exc())
+        exit_with_error(err)
+    _LOGGER.info("ACME Probe instance(s) instantiated.")
+    err = err - 1
 
     # Create output directory (if doesn't exist)
     now = strftime("%Y%m%d-%H%M%S", localtime())
-    if args.nofile is False:
+    if args.nofile == False:
         if args.outdir is None:
             outdir = os.path.join(os.path.expanduser('~/pyacmecapture'), now)
         else:
             outdir = args.outdir
-        trace.trace(1, "Output directory: %s" % outdir)
+        _LOGGER.debug("Output directory: %s", outdir)
 
         if args.out is None:
             report_filename = os.path.join(outdir, now + "-report.txt")
         else:
             report_filename = os.path.join(outdir, args.out + "-report.txt")
-        trace.trace(1, "Report filename: %s" % report_filename)
+        _LOGGER.debug("Report filename: %s", report_filename)
 
         try:
             os.makedirs(outdir)
         except OSError as e:
             if e.errno == os.errno.EEXIST:
-                trace.trace(1, "Directory '%s' already exists." % outdir)
+                _LOGGER.debug("Directory '%s' already exists.", outdir)
             else:
-                log(Fore.RED, "FAILED", "Create output directory")
-                trace.trace(2, traceback.format_exc())
+                _LOGGER.error("Failed to create output directory")
+                _LOGGER.debug(traceback.format_exc())
                 exit_with_error(err)
         except:
-            log(Fore.RED, "FAILED", "Create output directory")
-            trace.trace(2, traceback.format_exc())
+            _LOGGER.error("Failed to create output directory")
+            _LOGGER.debug(traceback.format_exc())
             exit_with_error(err)
-        log(Fore.GREEN, "OK", "Create output directory")
-
-    # Check ACME Cape is reachable
-    if iio_acme_cape.is_up() != True:
-        log(Fore.RED, "FAILED", "Ping ACME")
-        exit_with_error(err)
-    log(Fore.GREEN, "OK", "Ping ACME")
+        _LOGGER.info("Output directory created.")
     err = err - 1
 
-    # Init IIOAcmeCape instance
-    if iio_acme_cape.init() != True:
-        log(Fore.RED, "FAILED", "Init ACME IIO Context")
+    # Check ACME probe(s) are reachable
+    try:
+        for probe in probes:
+            if probe['dev'].is_up() != True:
+                _LOGGER.critical("Probe '%s' ping failed!", probe['name'])
+                exit_with_error(err)
+            else:
+                _LOGGER.debug("Probe '%s' ping ok.", probe['name'])
+    except:
+        _LOGGER.critical("Probe '%s' ping failed!", probe['name'])
+        _LOGGER.debug(traceback.format_exc())
         exit_with_error(err)
-    log(Fore.GREEN, "OK", "Init ACME Cape instance")
-    err = err - 1
-
-    # Check all probes are attached
-    failed = False
-    for i in args.slots:
-        attached = iio_acme_cape.probe_is_attached(i)
-        if attached is not True:
-            log(Fore.RED, "FAILED", "Detect probe in slot %u" % i)
-            failed = True
-        else:
-            log(Fore.GREEN, "OK", "Detect probe in slot %u" % i)
-    if failed is True:
-        exit_with_error(err)
+    _LOGGER.info("ACME Probe instance(s) instantiated.")
     err = err - 1
 
     # Create and configure capture threads
-    threads = []
-    failed = False
-    for i in args.slots:
+    for probe in probes:
+        # Instantiate a new capture thread per probe
         try:
             thread = IIODeviceCaptureThread(
-                iio_acme_cape, i, _CAPTURED_CHANNELS, args.bufsize,
-                args.duration, args.verbose)
+                probe['dev'], _CAPTURED_CHANNELS, args.bufsize, args.duration,
+                args.verbose)
+        except:
+            _LOGGER.error(
+                "Failed to instantiate capture thread for probe '%s'!", probe['name'])
+            _LOGGER.debug(traceback.format_exc())
+            exit_with_error(err)
+        _LOGGER.info("Capture thread for probe '%s' instantiated.", probe['name'])
+        # Configure new capture thread
+        try:
             ret = thread.configure_capture()
         except:
-            log(Fore.RED, "FAILED", "Configure capture thread for probe in slot #%u" % i)
-            trace.trace(2, traceback.format_exc())
+            _LOGGER.error(
+                "Failed to configure capture thread for probe '%s'!",
+                probe['name'])
+            _LOGGER.debug(traceback.format_exc())
             exit_with_error(err)
         if ret is False:
-            log(Fore.RED, "FAILED", "Configure capture thread for probe in slot #%u" % i)
+            _LOGGER.error(
+                "Failed to configure capture thread for probe '%s'!",
+                probe['name'])
             exit_with_error(err)
-        threads.append(thread)
-        log(Fore.GREEN, "OK", "Configure capture thread for probe in slot #%u" % i)
+        probe['thread'] = thread
+        _LOGGER.info("Capture thread for probe '%s' configured.", probe['name'])
     err = err - 1
 
     # Start capture threads
     try:
-        for thread in threads:
-            thread.start()
+        for probe in probes:
+            probe['thread'].start()
     except:
-        log(Fore.RED, "FAILED", "Start capture")
-        trace.trace(2, traceback.format_exc())
+        _LOGGER.critical("Failed to start capture!")
+        _LOGGER.debug(traceback.format_exc())
         exit_with_error(err)
-    log(Fore.GREEN, "OK", "Start capture")
+    _LOGGER.info("Capture started.")
     err = err - 1
 
     # Wait for capture threads to complete
-    for thread in threads:
-        thread.join()
-    log(Fore.GREEN, "OK", "Capture threads completed")
+    for probe in probes:
+        probe['thread'].join()
+    _LOGGER.info("Capture completed.")
 
-    if args.verbose >= 1:
-        for thread in threads:
-            thread.print_runtime_stats()
+    if args.verbose is True:
+        for probe in probes:
+            probe['thread'].print_runtime_stats()
 
     # Retrieve captured data
-    slot = 0
-    data = []
-    for thread in threads:
-        samples = thread.get_samples()
-        trace.trace(3, "Slot %u captured data: %s" % (samples['slot'], samples))
-        data.append(samples)
-    log(Fore.GREEN, "OK", "Retrieve captured samples")
+    for probe in probes:
+        probe['samples'] = probe['thread'].get_samples()
+        if args.verbose is True:
+            _LOGGER.debug(
+                "Probe %s captured data: %s", probe['name'], probe['samples'])
+    _LOGGER.info("Captured samples retrieved.")
 
     # Process samples
-    for i in range(args.count):
-        slot = data[i]['slot']
-
-        # Make time samples relative to fist sample
-        first_timestamp = data[i]["Time"]["samples"][0]
-        data[i]["Time"]["samples"] -= first_timestamp
-        timestamp_diffs = np.ediff1d(data[i]["Time"]["samples"])
+    for probe in probes:
+        # Make time samples relative to first sample
+        #FIXME Handle single timestamp corner case
+        first_timestamp = probe['samples']["Time"]["samples"][0]
+        probe['samples']["Time"]["samples"] -= first_timestamp
+        timestamp_diffs = np.ediff1d(probe['samples']["Time"]["samples"])
         timestamp_diffs_ms = timestamp_diffs / 1000000
-        trace.trace(3, "Slot %u timestamp_diffs (ms): %s" % (
-            slot, timestamp_diffs_ms))
+        if args.verbose is True:
+            _LOGGER.debug(
+                "Probe %s timestamp_diffs (ms): %s",
+                probe['name'], timestamp_diffs_ms)
         timestamp_diffs_min = np.amin(timestamp_diffs_ms)
         timestamp_diffs_max = np.amax(timestamp_diffs_ms)
         timestamp_diffs_avg = np.average(timestamp_diffs_ms)
-        trace.trace(1, "Slot %u Time difference between 2 samples (ms): "
-                       "min=%u max=%u avg=%u" % (slot,
-                                                 timestamp_diffs_min,
-                                                 timestamp_diffs_max,
-                                                 timestamp_diffs_avg))
-        real_capture_time_ms = data[i]["Time"]["samples"][-1] / 1000000
-        sample_count = len(data[i]["Time"]["samples"])
+        if args.verbose is True:
+            _LOGGER.debug(
+                "Probe %s Time difference between 2 samples (ms): "
+                "min=%u max=%u avg=%u",
+                probe['name'],
+                timestamp_diffs_min,
+                timestamp_diffs_max,
+                timestamp_diffs_avg)
+        real_capture_time_ms = probe['samples']["Time"]["samples"][-1] / 1000000
+        sample_count = len(probe['samples']["Time"]["samples"])
         real_sampling_rate = sample_count / (real_capture_time_ms / 1000.0)
-        trace.trace(1,
-                    "Slot %u: real capture duration: %u ms (%u samples)" % (
-                        slot, real_capture_time_ms, sample_count))
-        trace.trace(1,
-                    "Slot %u: real sampling rate: %u Hz" % (
-                        slot, real_sampling_rate))
+        if args.verbose is True:
+            _LOGGER.debug(
+                "Probe %s: real capture duration: %u ms (%u samples)",
+                probe['name'], real_capture_time_ms, sample_count)
+            _LOGGER.debug(
+                "Probe %s: real sampling rate: %u Hz",
+                probe['name'], real_sampling_rate)
 
         # Compute Power (P = Vbat * Ishunt)
-        data[i]["Power"] = {}
-        data[i]["Power"]["unit"] = "mW" # FIXME
-        data[i]["Power"]["samples"] = np.multiply(
-            data[i]["Vbat"]["samples"], data[i]["Ishunt"]["samples"])
-        data[i]["Power"]["samples"] /= 1000.0
-        trace.trace(3, "Slot %u power samples: %s" % (
-            slot, data[i]["Power"]["samples"]))
+        probe['samples']["Power"] = {}
+        probe['samples']["Power"]["unit"] = "mW" # FIXME
+        probe['samples']["Power"]["samples"] = np.multiply(
+            probe['samples']["Vbat"]["samples"],
+            probe['samples']["Ishunt"]["samples"])
+        probe['samples']["Power"]["samples"] /= 1000.0
+        if args.verbose is True:
+            _LOGGER.debug(
+                "Probe %s power samples: %s",
+                probe['name'], probe['samples']["Power"]["samples"])
 
         # Compute min, max, avg values for Vbat, Ishunt and Power
-        data[i]["Vbat min"] = np.amin(data[i]["Vbat"]["samples"])
-        data[i]["Vbat max"] = np.amax(data[i]["Vbat"]["samples"])
-        data[i]["Vbat avg"] = np.average(data[i]["Vbat"]["samples"])
-        data[i]["Ishunt min"] = np.amin(data[i]["Ishunt"]["samples"])
-        data[i]["Ishunt max"] = np.amax(data[i]["Ishunt"]["samples"])
-        data[i]["Ishunt avg"] = np.average(data[i]["Ishunt"]["samples"])
-        data[i]["Power min"] = np.amin(data[i]["Power"]["samples"])
-        data[i]["Power max"] = np.amax(data[i]["Power"]["samples"])
-        data[i]["Power avg"] = np.average(data[i]["Power"]["samples"])
-    log(Fore.GREEN, "OK", "Process samples")
+        probe['samples']["Vbat min"] = np.amin(probe['samples']["Vbat"]["samples"])
+        probe['samples']["Vbat max"] = np.amax(probe['samples']["Vbat"]["samples"])
+        probe['samples']["Vbat avg"] = np.average(probe['samples']["Vbat"]["samples"])
+        probe['samples']["Ishunt min"] = np.amin(probe['samples']["Ishunt"]["samples"])
+        probe['samples']["Ishunt max"] = np.amax(probe['samples']["Ishunt"]["samples"])
+        probe['samples']["Ishunt avg"] = np.average(probe['samples']["Ishunt"]["samples"])
+        probe['samples']["Power min"] = np.amin(probe['samples']["Power"]["samples"])
+        probe['samples']["Power max"] = np.amax(probe['samples']["Power"]["samples"])
+        probe['samples']["Power avg"] = np.average(probe['samples']["Power"]["samples"])
+    _LOGGER.info("Captured samples processed.")
 
     # Generate report
     # Use a dictionary to map table cells with data elements
     table = {}
-    table['rows'] = ['Slot', 'Shunt (mohm)',
+    table['rows'] = ['Name', 'Shunt (mohm)',
                      'Voltage', ' Min (mV)', ' Max (mV)', ' Avg (mV)',
                      'Current', ' Min (mA)', ' Max (mA)', ' Avg (mA)',
                      'Power', ' Min (mW)', ' Max (mW)', ' Avg (mW)']
@@ -659,60 +734,44 @@ def main():
     report.append("Captured Channels: %s" % _CAPTURED_CHANNELS)
     report.append("Oversampling ratio: %u" % _OVERSAMPLING_RATIO)
     report.append("Asynchronous reads: %s" % _ASYNCHRONOUS_READS)
-    report.append("Power Rails: %u" % args.count)
+    report.append("Power Rails: %u" % len(probes))
     report.append("Duration: %us\n" % args.duration)
 
     # Adjust column width with name so that it's never truncated
     cols_width = []
-    for i in range(args.count):
-        if args.names is not None:
-            cols_width.append(_REPORT_COL_PAD + max(
-                _REPORT_COLS_WIDTH_MIN, len(args.names[i])))
-        else:
-            cols_width.append(_REPORT_COL_PAD + _REPORT_COLS_WIDTH_MIN)
+    for probe in probes:
+        cols_width.append(
+            _REPORT_COL_PAD + max(_REPORT_COLS_WIDTH_MIN, len(probe['name'])))
 
     # Generate report
-    for r in table['rows']:
-        s = r.ljust(_REPORT_1ST_COL_WIDTH)
-        for i in range(args.count):
-            slot = data[i]['slot']
-            if r == 'Slot':
-                if args.names is not None:
-                    s += args.names[i].rjust(cols_width[i])
-                else:
-                    s += str(slot).rjust(cols_width[i])
-            elif r == 'Shunt (mohm)':
-                s += str(iio_acme_cape.get_shunt(slot) / 1000).rjust(
+    for row in table['rows']:
+        line = row.ljust(_REPORT_1ST_COL_WIDTH)
+        for i in range(len(probes)):
+            if 'Name' in row:
+                line += probes[i]['name'].rjust(cols_width[i])
+            elif 'Shunt (mohm)' in row:
+                line += str(probes[i]['dev'].shunt() / 1000).rjust(
                     cols_width[i])
-            elif table['data_keys'][r] is not None:
-                s += format(data[i][table['data_keys'][r]], '.1f').rjust(
+            elif table['data_keys'][row] is not None:
+                line += format(probes[i]['samples'][table['data_keys'][row]], '.1f').rjust(
                     cols_width[i])
-        report.append(s)
+        report.append(line)
 
     # Add output filenames to report
-    trace_filenames = []
     if args.nofile is False:
         report.append("\nReport file: %s" % report_filename)
-        for i in range(args.count):
-            slot = data[i]['slot']
+        for probe in probes:
             if args.out is None:
                 trace_filename = now
             else:
                 trace_filename = args.out
             trace_filename += "_"
-            if args.names is not None:
-                trace_filename += args.names[i]
-            else:
-                trace_filename += "Slot_%u" % slot
+            trace_filename += probe['name']
             trace_filename += ".csv"
             trace_filename = os.path.join(outdir, trace_filename)
-            if args.names is not None:
-                report.append("%s Trace file: %s" % (
-                    args.names[i], trace_filename))
-            else:
-                report.append("Slot %s Trace file: %s" % (
-                    slot, trace_filename))
-            trace_filenames.append(trace_filename)
+            report.append("%s Trace file: %s" % (
+                probe['name'], trace_filename))
+            probe['trace_filename'] = trace_filename
     report_max_length = len(max(report, key=len))
     dash_count = (report_max_length - len(" Power Measurement Report ")) / 2
 
@@ -737,53 +796,42 @@ def main():
                 print(line, file=of_report)
             of_report.close()
         except:
-            log(Fore.RED, "FAILED", "Save Power Measurement report")
-            trace.trace(2, traceback.format_exc())
+            _LOGGER.error("Failed to save Power Measurement report!")
+            _LOGGER.debug(traceback.format_exc())
             exit_with_error(err)
-        log(Fore.GREEN, "OK",
-            "Save Power Measurement report")
+        _LOGGER.info("Power Measurement report saved.")
 
     # Save Power Measurement trace to file (CSV format)
     if args.nofile is False:
-        for i in range(args.count):
-            slot = data[i]['slot']
-            trace.trace(1, "Trace file: %s" % trace_filenames[i])
+        for probe in probes:
             try:
-                of_trace = open(trace_filenames[i], 'w')
+                of_trace = open(probe['trace_filename'], 'w')
             except:
-                log(Fore.RED, "FAILED", "Create output trace file")
-                trace.trace(2, traceback.format_exc())
+                _LOGGER.info(
+                    "Failed to create output trace file %s",
+                    probe['trace_filename'])
+                _LOGGER.debug(traceback.format_exc())
                 exit_with_error(err)
 
             # Format trace header (name columns)
-            if args.names is not None:
-                s = "Time (%s), %s Voltage (%s), %s Current (%s), %s Power (%s)" % (
-                    data[i]["Time"]["unit"],
-                    args.names[i], data[i]["Vbat"]["unit"],
-                    args.names[i], data[i]["Ishunt"]["unit"],
-                    args.names[i], data[i]["Power"]["unit"])
-            else:
-                s = "Time (%s), Slot %u Voltage (%s), Slot %u Current (%s), Slot %u Power (%s)" % (
-                    data[i]["Time"]["unit"],
-                    slot, data[i]["Vbat"]["unit"],
-                    slot, data[i]["Ishunt"]["unit"],
-                    slot, data[i]["Power"]["unit"])
+            s = "Time (%s),%s Voltage (%s),%s Current (%s),%s Power (%s)" % (
+                probe['samples']["Time"]["unit"],
+                probe['name'], probe['samples']["Vbat"]["unit"],
+                probe['name'], probe['samples']["Ishunt"]["unit"],
+                probe['name'], probe['samples']["Power"]["unit"])
             print(s, file=of_trace)
             # Save samples in trace file
-            for j in range(len(data[i]["Ishunt"]["samples"])):
-                s = "%s, %s, %s, %s" % (
-                    data[i]["Time"]["samples"][j],
-                    data[i]["Vbat"]["samples"][j],
-                    data[i]["Ishunt"]["samples"][j],
-                    data[i]["Power"]["samples"][j])
+            for j in range(len(probe['samples']["Ishunt"]["samples"])):
+                s = "%s,%s,%s,%s" % (
+                    probe['samples']["Time"]["samples"][j],
+                    probe['samples']["Vbat"]["samples"][j],
+                    probe['samples']["Ishunt"]["samples"][j],
+                    probe['samples']["Power"]["samples"][j])
                 print(s, file=of_trace)
             of_trace.close()
-            if args.names is not None:
-                log(Fore.GREEN, "OK",
-                    "Save %s Power Measurement Trace" % args.names[i])
-            else:
-                log(Fore.GREEN, "OK",
-                    "Save Slot %u Power Measurement Trace" % slot)
+            _LOGGER.info(
+                "%s Power Measurement Trace saved in %s.",
+                probe['name'], probe['trace_filename'])
 
     # Display report
     print()
