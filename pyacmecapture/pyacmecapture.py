@@ -55,6 +55,7 @@ _LOGGER_NAME = "pyacmecapture"
 
 # create logger
 _LOGGER = logging.getLogger(_LOGGER_NAME)
+_VERBOSE_LOGLEVEL = logging.DEBUG - 5
 
 
 def exit_with_error(err):
@@ -77,6 +78,23 @@ def exit_with_error(err):
     exit(err)
 
 
+def verbose(msg, *args, **kwargs):
+    """ Logs a message with custom level VERBOSE.
+
+    Args:
+        msg (string): message format string
+        args (strings): arguments which are merged into msg
+            using the string formatting operator
+        kwargs (strings): optional keyword arguments
+
+    Returns:
+        None
+
+    """
+    if logging.getLogger().isEnabledFor(_VERBOSE_LOGLEVEL):
+        _LOGGER.log(_VERBOSE_LOGLEVEL, msg)
+
+
 class IIODeviceCaptureThread(threading.Thread):
     """ IIO ACME Capture thread
 
@@ -85,7 +103,7 @@ class IIODeviceCaptureThread(threading.Thread):
 
     """
 
-    def __init__(self, probe, channels, bufsize, duration, verbose=False):
+    def __init__(self, probe, channels, bufsize, duration):
         """ Initialise IIODeviceCaptureThread class
 
         Args:
@@ -94,7 +112,6 @@ class IIODeviceCaptureThread(threading.Thread):
                         Supported channels: 'Vshunt', 'Vbat', 'Ishunt', 'Power'
             bufsize (int): capture buffer size (in samples)
             duration (int): capture duration (in seconds)
-            verbose (bool): print samples
 
         Returns:
             None
@@ -106,7 +123,6 @@ class IIODeviceCaptureThread(threading.Thread):
         self._channels = channels
         self._bufsize = bufsize
         self._duration = duration
-        self._verbose = verbose
         self._timestamp_thread_start = None
         self._thread_execution_time = None
         self._refill_start_times = None
@@ -118,10 +134,10 @@ class IIODeviceCaptureThread(threading.Thread):
 
         _LOGGER.debug(
             "Thread parameters: probe=%s channels=%s buffer size=%u duration="
-            "%us verbose=%s", self._probe.name(), self._channels,
-            self._bufsize, self._duration, self._verbose)
+            "%us", self._probe.name(), self._channels,
+            self._bufsize, self._duration)
 
-    def _log(self, loglevel, msg):
+    def _log(self, loglevel, msg, *args, **kwargs):
         """ Print log messages, prefixed with thread name
 
         Args:
@@ -132,7 +148,7 @@ class IIODeviceCaptureThread(threading.Thread):
             None
 
         """
-        _LOGGER.log(loglevel, "[Thread " + self._probe.name() + "] " + msg)
+        _LOGGER.log(loglevel, "[Thread %s] %s", self._probe.name(), msg)
 
     def configure_capture(self):
         """ Configure capture parameters (enable channel(s),
@@ -224,8 +240,8 @@ class IIODeviceCaptureThread(threading.Thread):
                     self._samples[ch]["failed"] = False
                     self._samples[ch]["unit"] = s["unit"]
                     self._samples[ch]["samples"] = s["samples"]
-                if self._verbose is True:
-                    self._log(logging.DEBUG, "self._samples[%s] = %s" % (
+                self._log(
+                    _VERBOSE_LOGLEVEL, "self._samples[%s] = %s" % (
                         ch, str(self._samples[ch])))
             self._read_end_times.append(time())
             elapsed_time = time() - self._timestamp_thread_start
@@ -247,9 +263,12 @@ class IIODeviceCaptureThread(threading.Thread):
             None
 
         """
-        self._log(logging.DEBUG, "------------- Runtime Stats -------------")
         self._log(
-            logging.DEBUG, "Execution time: %s" % self._thread_execution_time)
+            _VERBOSE_LOGLEVEL,
+            "------------------------- Runtime Stats -------------------------")
+        self._log(
+            _VERBOSE_LOGLEVEL,
+            "Execution time: %s" % self._thread_execution_time)
         # Convert list to numpy array
         self._refill_start_times = np.asarray(self._refill_start_times)
         self._refill_end_times = np.asarray(self._refill_end_times)
@@ -274,20 +293,23 @@ class IIODeviceCaptureThread(threading.Thread):
             self._read_end_times, self._read_start_times)
 
         # Print time each time buffer was getting refilled
-        self._log(logging.DEBUG, "Buffer Refill start times (ms): %s" % \
+        self._log(
+            _VERBOSE_LOGLEVEL, "Buffer Refill start times (ms): %s" % \
             self._refill_start_times)
-        self._log(logging.DEBUG, "Buffer Refill end times (ms): %s" % \
+        self._log(
+            _VERBOSE_LOGLEVEL, "Buffer Refill end times (ms): %s" % \
             self._refill_end_times)
         # Print time spent refilling buffer
         self._log(
-            logging.DEBUG, "Buffer Refill duration (ms): %s" % refill_durations)
+            _VERBOSE_LOGLEVEL,
+            "Buffer Refill duration (ms): %s" % refill_durations)
         if len(self._refill_start_times) > 1:
             # Print buffer refill time stats
             refill_durations_min = np.amin(refill_durations)
             refill_durations_max = np.amax(refill_durations)
             refill_durations_avg = np.average(refill_durations)
             self._log(
-                logging.DEBUG,
+                _VERBOSE_LOGLEVEL,
                 "Buffer Refill Duration (ms): min=%s max=%s avg=%s" % (
                     refill_durations_min,
                     refill_durations_max,
@@ -295,14 +317,14 @@ class IIODeviceCaptureThread(threading.Thread):
             # Print delays between 2 consecutive buffer refills
             refill_delays = np.ediff1d(self._refill_start_times)
             self._log(
-                logging.DEBUG,
+                _VERBOSE_LOGLEVEL,
                 "Delay between 2 Buffer Refill (ms): %s" % refill_delays)
             # Print buffer refill delay stats
             refill_delays_min = np.amin(refill_delays)
             refill_delays_max = np.amax(refill_delays)
             refill_delays_avg = np.average(refill_delays)
             self._log(
-                logging.DEBUG,
+                _VERBOSE_LOGLEVEL,
                 "Buffer Refill Delay (ms): min=%s max=%s avg=%s" % (
                     refill_delays_min,
                     refill_delays_max,
@@ -310,21 +332,21 @@ class IIODeviceCaptureThread(threading.Thread):
 
         # Print time each time buffer was getting read
         self._log(
-            logging.DEBUG,
+            _VERBOSE_LOGLEVEL,
             "Buffer Read start times (ms): %s" % self._read_start_times)
         self._log(
-            logging.DEBUG,
+            _VERBOSE_LOGLEVEL,
             "Buffer Read end times (ms): %s" % self._read_end_times)
         # Print time spent reading buffer
         self._log(
-            logging.DEBUG, "Buffer Read duration (ms): %s" % read_durations)
+            _VERBOSE_LOGLEVEL, "Buffer Read duration (ms): %s" % read_durations)
         if len(self._read_start_times) > 1:
             # Print buffer read time stats
             read_durations_min = np.amin(read_durations)
             read_durations_max = np.amax(read_durations)
             read_durations_avg = np.average(read_durations)
             self._log(
-                logging.DEBUG,
+                _VERBOSE_LOGLEVEL,
                 "Buffer Read Duration (ms): min=%s max=%s avg=%s" % (
                     read_durations_min,
                     read_durations_max,
@@ -332,19 +354,21 @@ class IIODeviceCaptureThread(threading.Thread):
             # Print delays between 2 consecutive buffer reads
             read_delays = np.ediff1d(self._read_start_times)
             self._log(
-                logging.DEBUG,
+                _VERBOSE_LOGLEVEL,
                 "Delay between 2 Buffer Read (ms): %s" % read_delays)
             # Print buffer read delay stats
             read_delays_min = np.amin(read_delays)
             read_delays_max = np.amax(read_delays)
             read_delays_avg = np.average(read_delays)
             self._log(
-                logging.DEBUG,
+                _VERBOSE_LOGLEVEL,
                 "Buffer Read Delay (ms): min=%s max=%s avg=%s" % (
                     read_delays_min,
                     read_delays_max,
                     read_delays_avg))
-        self._log(logging.DEBUG, "-----------------------------------------")
+        self._log(
+            _VERBOSE_LOGLEVEL,
+            "-----------------------------------------------------------------")
 
     def get_samples(self):
         """ Return collected samples. To be called once thread completed.
@@ -445,27 +469,39 @@ def main():
 
     parser.add_argument(
         '--loglevel', '-l', metavar='LOGLEVEL', default='WARNING',
-        help='''Logging level (default: WARNING).''')
-    parser.add_argument('--verbose', '-v', action='store_true',
-                        help='Use this option to trace internal variables.')
+        help='''Logging level (valid: 'CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG', VERBOSE).
+                Default log level: 'WARNING'.
+                Use custom level "VERBOSE" to print internal data.''')
 
     args = parser.parse_args()
 
     # Configure logging level
-    numeric_level = getattr(logging, args.loglevel.upper(), None)
-    if not isinstance(numeric_level, int):
-        raise ValueError('Invalid log level: %s' % args.loglevel)
-    if args.loglevel.upper() == 'DEBUG':
+    args.loglevel = args.loglevel.upper()
+    logging.addLevelName(_VERBOSE_LOGLEVEL, "VERBOSE")
+    _LOGGER.verbose = verbose
+    if args.loglevel == 'VERBOSE':
         logging.basicConfig(
             format='%(levelname)s: %(name)s: %(message)s',
-            name=_LOGGER_NAME, level=numeric_level)
-    else:
+            name=_LOGGER_NAME, level=_VERBOSE_LOGLEVEL)
+    elif args.loglevel == 'DEBUG':
         logging.basicConfig(
-            format='%(levelname)s: %(message)s',
-            level=numeric_level)
+            format='%(levelname)s: %(name)s: %(message)s',
+            name=_LOGGER_NAME, level=logging.DEBUG)
+    else:
+        numeric_level = getattr(logging, args.loglevel, None)
+        if not isinstance(numeric_level, int):
+            logging.basicConfig(
+                format='%(levelname)s: %(message)s',
+                level=logging.ERROR)
+            _LOGGER.error("Invalid log level! ('%s')", args.loglevel)
+            exit_with_error(err)
+        else:
+            logging.basicConfig(
+                format='%(levelname)s: %(message)s',
+                level=numeric_level)
 
     # Parse user arguments and check that they are valid
-    _LOGGER.debug("User arguments: " + str(args)[10:-1])
+    _LOGGER.debug("User arguments: %s", str(args)[10:-1])
     # Check duration and buffer size are valid
     try:
         assert args.duration > 0
@@ -594,8 +630,7 @@ def main():
         # Instantiate a new capture thread per probe
         try:
             thread = IIODeviceCaptureThread(
-                probe['dev'], _CAPTURED_CHANNELS, args.bufsize, args.duration,
-                args.verbose)
+                probe['dev'], _CAPTURED_CHANNELS, args.bufsize, args.duration)
         except:
             _LOGGER.error(
                 "Failed to instantiate capture thread for probe '%s'!", probe['name'])
@@ -636,16 +671,14 @@ def main():
         probe['thread'].join()
     _LOGGER.info("Capture completed.")
 
-    if args.verbose is True:
-        for probe in probes:
-            probe['thread'].print_runtime_stats()
+    for probe in probes:
+        probe['thread'].print_runtime_stats()
 
     # Retrieve captured data
     for probe in probes:
         probe['samples'] = probe['thread'].get_samples()
-        if args.verbose is True:
-            _LOGGER.debug(
-                "Probe %s captured data: %s", probe['name'], probe['samples'])
+        _LOGGER.verbose(
+            "Probe %s captured data: %s" % (probe['name'], probe['samples']))
     _LOGGER.info("Captured samples retrieved.")
 
     # Process samples
@@ -656,31 +689,28 @@ def main():
         probe['samples']["Time"]["samples"] -= first_timestamp
         timestamp_diffs = np.ediff1d(probe['samples']["Time"]["samples"])
         timestamp_diffs_ms = timestamp_diffs / 1000000
-        if args.verbose is True:
-            _LOGGER.debug(
-                "Probe %s timestamp_diffs (ms): %s",
-                probe['name'], timestamp_diffs_ms)
+        _LOGGER.verbose(
+            "Probe %s timestamp_diffs (ms): %s" % (
+                probe['name'], timestamp_diffs_ms))
         timestamp_diffs_min = np.amin(timestamp_diffs_ms)
         timestamp_diffs_max = np.amax(timestamp_diffs_ms)
         timestamp_diffs_avg = np.average(timestamp_diffs_ms)
-        if args.verbose is True:
-            _LOGGER.debug(
-                "Probe %s Time difference between 2 samples (ms): "
-                "min=%u max=%u avg=%u",
+        _LOGGER.verbose(
+            "Probe %s Time difference between 2 samples (ms): "
+            "min=%u max=%u avg=%u" % (
                 probe['name'],
                 timestamp_diffs_min,
                 timestamp_diffs_max,
-                timestamp_diffs_avg)
+                timestamp_diffs_avg))
         real_capture_time_ms = probe['samples']["Time"]["samples"][-1] / 1000000
         sample_count = len(probe['samples']["Time"]["samples"])
         real_sampling_rate = sample_count / (real_capture_time_ms / 1000.0)
-        if args.verbose is True:
-            _LOGGER.debug(
-                "Probe %s: real capture duration: %u ms (%u samples)",
-                probe['name'], real_capture_time_ms, sample_count)
-            _LOGGER.debug(
-                "Probe %s: real sampling rate: %u Hz",
-                probe['name'], real_sampling_rate)
+        _LOGGER.verbose(
+            "Probe %s: real capture duration: %u ms (%u samples)" % (
+                probe['name'], real_capture_time_ms, sample_count))
+        _LOGGER.verbose(
+            "Probe %s: real sampling rate: %u Hz" % (
+                probe['name'], real_sampling_rate))
 
         # Compute Power (P = Vbat * Ishunt)
         probe['samples']["Power"] = {}
@@ -689,10 +719,9 @@ def main():
             probe['samples']["Vbat"]["samples"],
             probe['samples']["Ishunt"]["samples"])
         probe['samples']["Power"]["samples"] /= 1000.0
-        if args.verbose is True:
-            _LOGGER.debug(
-                "Probe %s power samples: %s",
-                probe['name'], probe['samples']["Power"]["samples"])
+        _LOGGER.verbose(
+            "Probe %s power samples: %s" % (
+                probe['name'], probe['samples']["Power"]["samples"]))
 
         # Compute min, max, avg values for Vbat, Ishunt and Power
         probe['samples']["Vbat min"] = np.amin(probe['samples']["Vbat"]["samples"])
