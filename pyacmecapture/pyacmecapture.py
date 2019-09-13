@@ -29,7 +29,7 @@ import threading
 import logging
 from time import time, localtime, strftime
 import numpy as np
-from iioacmeprobe import VirtualIIOAcmeProbe
+from iioacmeprobe import IIOAcmeProbe, VirtualIIOAcmeProbe
 
 
 __app_name__ = "Python ACME Power Capture Utility"
@@ -189,6 +189,7 @@ class IIODeviceCaptureThread(threading.Thread):
             self._log(logging.ERROR, "Failed to allocate capture buffer!")
             return False
         self._log(logging.DEBUG, "Capture buffer allocated.")
+
         return True
 
     def run(self):
@@ -566,8 +567,8 @@ def main():
     try:
         for probe in probes:
             if args.virtual is False:
-                print("not yet implemented")
-                exit_with_error(0)
+                probe['dev'] = IIOAcmeProbe(
+                    probe['ip'], probe['slot'], probe['name'])
             else:
                 probe['dev'] = VirtualIIOAcmeProbe(
                     probe['ip'], probe['slot'], probe['name'])
@@ -579,9 +580,22 @@ def main():
     _LOGGER.info("ACME Probe instance(s) instantiated.")
     err = err - 1
 
+    # Attach to probe(s)
+    for probe in probes:
+        if probe['dev'].attach() is True:
+            _LOGGER.debug(
+                "ACME Probe '%s' attached.", probe['name'])
+        else:
+            _LOGGER.critical(
+                "Failed to attach to ACME probe '%s'!", probe['name'])
+            exit_with_error(err)
+
+    _LOGGER.info("ACME Probe(s) attached.")
+    err = err - 1
+
     # Create output directory (if doesn't exist)
     now = strftime("%Y%m%d-%H%M%S", localtime())
-    if args.nofile == False:
+    if args.nofile is False:
         if args.outdir is None:
             outdir = os.path.join(os.path.expanduser('~/pyacmecapture'), now)
         else:
@@ -610,21 +624,6 @@ def main():
         _LOGGER.info("Output directory created.")
     err = err - 1
 
-    # Check ACME probe(s) are reachable
-    try:
-        for probe in probes:
-            if probe['dev'].is_up() != True:
-                _LOGGER.critical("Probe '%s' ping failed!", probe['name'])
-                exit_with_error(err)
-            else:
-                _LOGGER.debug("Probe '%s' ping ok.", probe['name'])
-    except:
-        _LOGGER.critical("Probe '%s' ping failed!", probe['name'])
-        _LOGGER.debug(traceback.format_exc())
-        exit_with_error(err)
-    _LOGGER.info("ACME Probe instance(s) instantiated.")
-    err = err - 1
-
     # Create and configure capture threads
     for probe in probes:
         # Instantiate a new capture thread per probe
@@ -633,10 +632,12 @@ def main():
                 probe['dev'], _CAPTURED_CHANNELS, args.bufsize, args.duration)
         except:
             _LOGGER.error(
-                "Failed to instantiate capture thread for probe '%s'!", probe['name'])
+                "Failed to instantiate capture thread for probe '%s'!",
+                probe['name'])
             _LOGGER.debug(traceback.format_exc())
             exit_with_error(err)
-        _LOGGER.info("Capture thread for probe '%s' instantiated.", probe['name'])
+        _LOGGER.debug(
+            "Capture thread for probe '%s' instantiated.", probe['name'])
         # Configure new capture thread
         try:
             ret = thread.configure_capture()
@@ -652,7 +653,7 @@ def main():
                 probe['name'])
             exit_with_error(err)
         probe['thread'] = thread
-        _LOGGER.info("Capture thread for probe '%s' configured.", probe['name'])
+        _LOGGER.debug("Capture thread for probe '%s' configured.", probe['name'])
     err = err - 1
 
     # Start capture threads
