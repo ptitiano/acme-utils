@@ -313,43 +313,6 @@ class IIOAcmeProbe(object):
         self._logger.debug("Probe has power switch: %s", pwr_switch)
         return pwr_switch
 
-    def _find_iio_device_index(self, proxy, slot):
-        """ ACME slots are labelled starting from 1,
-            but IIO keeps only track of present devices, starting from 0.
-            E.g. if there are 2 probes in slots 2 and 5,
-            IIO context has only 2 devices at index 0 and 1.
-            Therefore, need to map ACME slot to IIO device index.
-            Browse ACME slots one by one to find which ones are populated and
-            find the correct IIO device index.
-
-        Args:
-            proxy (XMLRPC ServerProxy object) : ACME XMLRPC server
-            slot (int): ACME cape slot, in which the ACME probe is attached to
-                (as labelled on the ACME cape).
-
-        Returns:
-            Return IIO device index (int) of the selected probe (>= 0),
-            None if not found.
-
-        """
-        iio_device_idx = None
-        for s in range(1, slot + 1):
-            info = self._get_probe_info(proxy, s)
-            if info is not None:
-                if iio_device_idx is None:
-                    iio_device_idx = 0
-                else:
-                    iio_device_idx = iio_device_idx + 1
-        if iio_device_idx is None:
-            self._logger.warning(
-                "IIO device index for probe in slot %u not found.",
-                slot)
-        else:
-            self._logger.debug(
-                "IIO device index for probe in slot %u is %u.",
-                slot, iio_device_idx)
-        return iio_device_idx
-
     def attach(self):
         """ Check that the probe is reachable, then create IIO context and
             retrieve probe's characteristics.
@@ -393,13 +356,25 @@ class IIOAcmeProbe(object):
         if self._pwr_switch is None:
             return False
 
-        # Retrieve probe's IIO device index and save it
-        iio_device_idx = self._find_iio_device_index(self._proxy, self._slot)
-        if iio_device_idx is None:
+        # Retrieve probe's IIO device given its slot
+        try:
+            for iio_dev in self._iioctx.devices:
+                if int(iio_dev.attrs['slot'].value) == self._slot:
+                    self._iio_device = iio_dev
+                    break
+        except:
+            self._logger.critical(
+                "Unexpected error while retrieving IIO device!")
+            self._logger.debug(traceback.format_exc())
+        if self._iio_device is None:
+            self._logger.error(
+                "Failed to retrieve IIO device of probe in slot %u!",
+                self._slot)
             return False
-        self._iio_device = self._iioctx.devices[iio_device_idx]
-        self._attached = True
+        self._logger.debug("IIO device of probe in slot %u found.", self._slot)
         self._show_iio_device_attributes()
+
+        self._attached = True
         return True
 
     def is_attached(self):
